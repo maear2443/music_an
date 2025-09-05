@@ -84,14 +84,15 @@ class MusicAnalyzerApp:
             self.log_status(f"클립보드 복사 중 오류 발생: {e}")
 
     def export_to_srt(self):
-        """가사 데이터를 추출하여 표준 .srt 파일로 저장합니다."""
-        if not self.analysis_data or "lyrics" not in self.analysis_data or not self.analysis_data["lyrics"]:
-            self.log_status("오류: 내보낼 가사 데이터가 없습니다.")
+        """재구성된 줄 단위 가사 데이터를 표준 .srt 파일로 저장합니다."""
+        if not self.analysis_data or "reconstructed_lyrics" not in self.analysis_data or not self.analysis_data["reconstructed_lyrics"]:
+            self.log_status("오류: 내보낼 가사 데이터가 없거나, 아직 줄 단위로 재구성되지 않았습니다.")
             return
 
         try:
             srt_content = []
-            lyrics = self.analysis_data["lyrics"]
+            # 재구성된 줄 단위 가사를 사용합니다.
+            lyrics = self.analysis_data["reconstructed_lyrics"]
             for i, item in enumerate(lyrics):
                 sequence = i + 1
                 start_time = item.get("start", "00:00:00,000")
@@ -137,41 +138,90 @@ class MusicAnalyzerApp:
     def log_status(self, message):
         self.root.after(0, self._update_text_widget, self.status_text, message)
 
+    def _time_str_to_ms(self, time_str):
+        """HH:MM:SS,ms 형식의 시간 문자열을 밀리초(ms)로 변환합니다."""
+        parts = time_str.split(',')
+        h, m, s = map(int, parts[0].split(':'))
+        ms = int(parts[1])
+        return (h * 3600 + m * 60 + s) * 1000 + ms
+
+    def _reconstruct_lines_from_words(self, word_level_lyrics, pause_threshold_ms=700):
+        """단어 단위 가사 데이터를 줄 단위로 재구성합니다."""
+        if not word_level_lyrics:
+            return []
+
+        lines = []
+        current_line_words = [word_level_lyrics[0]]
+
+        for i in range(1, len(word_level_lyrics)):
+            prev_word = word_level_lyrics[i-1]
+            current_word = word_level_lyrics[i]
+
+            try:
+                prev_end_ms = self._time_str_to_ms(prev_word['end'])
+                current_start_ms = self._time_str_to_ms(current_word['start'])
+                pause_duration = current_start_ms - prev_end_ms
+
+                if pause_duration > pause_threshold_ms:
+                    # 줄바꿈으로 간주
+                    line_text = " ".join(w['word'] for w in current_line_words)
+                    line_start = current_line_words[0]['start']
+                    line_end = current_line_words[-1]['end']
+                    lines.append({"start": line_start, "end": line_end, "lyric": line_text})
+                    current_line_words = [current_word]
+                else:
+                    current_line_words.append(current_word)
+            except (ValueError, KeyError):
+                # 타임스탬프 형식이 잘못된 경우, 현재 단어를 새 줄로 처리
+                if current_line_words:
+                    line_text = " ".join(w['word'] for w in current_line_words)
+                    line_start = current_line_words[0].get('start', 'N/A')
+                    line_end = current_line_words[-1].get('end', 'N/A')
+                    lines.append({"start": line_start, "end": line_end, "lyric": line_text})
+                current_line_words = [current_word]
+
+
+        # 마지막 줄 추가
+        if current_line_words:
+            line_text = " ".join(w['word'] for w in current_line_words)
+            line_start = current_line_words[0]['start']
+            line_end = current_line_words[-1]['end']
+            lines.append({"start": line_start, "end": line_end, "lyric": line_text})
+
+        return lines
+
     def process_and_display_results(self, result_text):
         """Gemini 응답을 파싱하고, 결과를 각 영역에 맞게 생성 및 표시합니다."""
         try:
             self.log_status("분석 결과 파싱 중...")
-            self.analysis_data = None # 이전 데이터 초기화
-            # Clear previous results
+            self.analysis_data = None
             self.root.after(0, self._update_text_widget, self.result_text, "", True)
             self.root.after(0, self._update_text_widget, self.lyrics_text, "", True)
-
 
             cleaned_text = result_text.strip().replace("```json", "").replace("```", "")
             self.analysis_data = json.loads(cleaned_text)
 
-            # 1. 분석 결과 및 Suno 프롬프트 포맷팅 및 표시
+            # 1. 분석 요약 및 Suno 프롬프트 표시
             suno_prompt = self.generate_suno_prompt(self.analysis_data)
             analysis_summary = self.format_analysis_summary(self.analysis_data)
-
-            result_display_text = (
-                f"--- 분석 요약 ---\n{analysis_summary}\n\n"
-                f"--- 생성된 Suno AI 프롬프트 ---\n{suno_prompt}"
-            )
+            result_display_text = f"--- 분석 요약 ---\n{analysis_summary}\n\n--- 생성된 Suno AI 프롬프트 ---\n{suno_prompt}"
             self.root.after(0, self._update_text_widget, self.result_text, result_display_text, True)
             self.root.after(0, lambda: self.copy_button.config(state=tk.NORMAL))
 
-            # 2. 가사 포맷팅 및 표시
-            lyrics = self.analysis_data.get("lyrics", [])
-            if lyrics:
-                lyrics_display_text = "\n".join([f"[{item.get('start', 'N/A')}] {item.get('lyric', '')}" for item in lyrics])
+            # 2. 단어 단위 가사를 줄 단위로 재구성하여 표시
+            word_lyrics = self.analysis_data.get("lyrics", [])
+            if word_lyrics:
+                self.log_status("단어 단위 가사를 줄 단위로 재구성 중...")
+                reconstructed_lines = self._reconstruct_lines_from_words(word_lyrics)
+                self.analysis_data['reconstructed_lyrics'] = reconstructed_lines # SRT 내보내기를 위해 저장
+
+                lyrics_display_text = "\n".join([f"[{line.get('start')} --> {line.get('end')}] {line.get('lyric')}" for line in reconstructed_lines])
                 self.root.after(0, self._update_text_widget, self.lyrics_text, lyrics_display_text, True)
                 self.root.after(0, lambda: self.export_srt_button.config(state=tk.NORMAL))
+                self.log_status("가사 재구성 및 표시 완료!")
             else:
                 self.root.after(0, self._update_text_widget, self.lyrics_text, "추출된 가사가 없습니다.", True)
                 self.root.after(0, lambda: self.export_srt_button.config(state=tk.DISABLED))
-
-            self.log_status("결과 표시 완료!")
 
         except json.JSONDecodeError:
             error_msg = "오류: Gemini로부터 받은 분석 결과를 파싱하는데 실패했습니다. 원본 출력을 표시합니다."
@@ -189,16 +239,9 @@ class MusicAnalyzerApp:
             chords = data.get("chords", "정보 없음")
             bpm = data.get("bpm", 0)
             emotions = data.get("emotions", [])
-
             emotion_lines = [f"- {e.get('emotion', '알 수 없음')}: {e.get('percentage', 0)}%" for e in emotions]
             emotion_summary = "\n".join(emotion_lines)
-
-            return (
-                f"장르: {genre}\n"
-                f"코드: {chords}\n"
-                f"BPM: {bpm}\n"
-                f"감정 분석:\n{emotion_summary}"
-            )
+            return f"장르: {genre}\n코드: {chords}\nBPM: {bpm}\n감정 분석:\n{emotion_summary}"
         except Exception:
             return "분석 데이터 요약에 실패했습니다."
 
@@ -209,19 +252,10 @@ class MusicAnalyzerApp:
             chords = data.get("chords", "a simple")
             bpm = data.get("bpm", 120)
             emotions = data.get("emotions", [])
-
-            # 퍼센트가 높은 순으로 정렬하여 상위 감정들을 사용
             emotions.sort(key=lambda x: x.get('percentage', 0), reverse=True)
             emotion_names = [e.get('emotion', '') for e in emotions]
-            # 영문 프롬프트를 위해 간단한 번역 또는 영문 키를 요청해야 하지만, 여기서는 한글을 그대로 사용
             emotion_str = ", ".join(emotion_names[:3]) if emotion_names else "unique"
-
-            prompt = (
-                f"A song in the style of {genre}, featuring a {chords} chord progression. "
-                f"The overall mood is {emotion_str}. "
-                f"The tempo is around {bpm} BPM."
-            )
-            return prompt
+            return f"A song in the style of {genre}, featuring a {chords} chord progression. The overall mood is {emotion_str}. The tempo is around {bpm} BPM."
         except Exception as e:
             self.log_status(f"프롬프트 생성 중 오류: {e}")
             return "Could not generate prompt from the provided data."
@@ -277,33 +311,27 @@ class MusicAnalyzerApp:
 
             prompt = """
             You are a world-class music analyst. Your task is to analyze the provided audio file and return ONLY a single, valid JSON object in KOREAN.
-            Do not include any explanatory text, markdown formatting like ```json, or anything else outside of the JSON object itself.
+            Do not include any explanatory text or markdown formatting.
 
-            The JSON object must contain the following keys. All string values must be in Korean.
-            - "genre": A string describing the primary genre in Korean (e.g., "인디 팝", "오케스트라 사운드트랙", "클래식 록").
-            - "chords": A string representing the main chord progression (e.g., "C-G-Am-F").
+            **CRITICAL INSTRUCTIONS FOR ACCURATE, WORD-LEVEL LYRICS:**
+            1.  You MUST transcribe the ENTIRE song from beginning to end. Do NOT summarize or omit any lyrics.
+            2.  The "lyrics" key in the JSON must be an array of WORD objects. DO NOT provide line-level timestamps.
+            3.  Each object in the "lyrics" array must represent a single word and have three keys: "word" (the transcribed word in Korean), "start" (the word's start time in "HH:MM:SS,ms" format), and "end" (the word's end time in "HH:MM:SS,ms" format).
+            4.  If the song is instrumental, return an empty array [] for the "lyrics" key.
+
+            The JSON object must contain the following keys:
+            - "genre": A string describing the primary genre in Korean.
+            - "chords": A string representing the main chord progression.
             - "bpm": An integer for the beats per minute.
-            - "emotions": An array of exactly 6 objects. Each object must have two keys: "emotion" (a string in Korean, e.g., "활기찬") and "percentage" (an integer from 0 to 100). Example: {"emotion": "행복", "percentage": 85}.
-            - "lyrics": An array of objects representing the song's lyrics with timestamps. If the song is instrumental, return an empty array []. Each object must have three keys: "start" (the start time in "HH:MM:SS,ms" format), "end" (the end time in "HH:MM:SS,ms" format), and "lyric" (the lyric text as a string in Korean).
+            - "emotions": An array of 6 objects, each with "emotion" (in Korean) and "percentage" keys.
+            - "lyrics": An array of WORD-LEVEL timestamp objects as described above.
 
-            Example of the final JSON structure:
-            {
-              "genre": "모던 록",
-              "chords": "Am-G-C-F",
-              "bpm": 128,
-              "emotions": [
-                {"emotion": "희망찬", "percentage": 90},
-                {"emotion": "경쾌한", "percentage": 85},
-                {"emotion": "감성적인", "percentage": 70},
-                {"emotion": "따뜻한", "percentage": 60},
-                {"emotion": "생동감 있는", "percentage": 75},
-                {"emotion": "긍정적인", "percentage": 80}
-              ],
-              "lyrics": [
-                {"start": "00:00:15,250", "end": "00:00:18,100", "lyric": "첫 번째 가사입니다"},
-                {"start": "00:00:18,500", "end": "00:00:21,800", "lyric": "이것은 두 번째 가사"}
-              ]
-            }
+            Example of the "lyrics" array structure:
+            "lyrics": [
+              {"word": "첫", "start": "00:00:15,250", "end": "00:00:15,450"},
+              {"word": "번째", "start": "00:00:15,450", "end": "00:00:15,800"},
+              {"word": "가사", "start": "00:00:15,900", "end": "00:00:16,300"}
+            ]
             """
 
             response = model.generate_content([prompt, music_file], request_options={'timeout': 600})
